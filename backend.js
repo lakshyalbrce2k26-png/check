@@ -12,8 +12,8 @@ const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient, PutCommand, GetCommand, ScanCommand, UpdateCommand, DeleteCommand, QueryCommand } = require("@aws-sdk/lib-dynamodb");
 const chatRoute = require('./chatRoute'); 
 const axios = require('axios'); // Make sure to install: npm install axios
-// --- IMPORT PHONEPE SDK ---
-const { StandardCheckoutClient, StandardCheckoutPayRequest, Env } = require('phonepe-pg-sdk-node');
+// --- IMPORT PHONEPE SDK (Only used for Verify) ---
+const { StandardCheckoutClient, Env } = require('phonepe-pg-sdk-node');
 
 
 // const Razorpay = require('razorpay'); // Payment Disabled for now
@@ -100,12 +100,15 @@ const sesClient = new SESv2Client({
 });
 
 // Initialize PhonePe Client (Singleton Pattern)
-// Used ONLY for verify/status check, NOT for create order
+// Used ONLY for verify/status check
 const initPhonePeClient = () => {
     const clientId = process.env.PHONEPE_CLIENT_ID;
     const clientSecret = process.env.PHONEPE_CLIENT_SECRET;
     const clientVersion = process.env.PHONEPE_CLIENT_VERSION || 1;
-    const env = process.env.PHONEPE_ENV === 'PRODUCTION' ? Env.PRODUCTION : Env.SANDBOX;
+    
+    // FORCE PRODUCTION FOR VERIFY TOO
+    // If you are LIVE, this MUST be Env.PRODUCTION
+    const env = Env.PRODUCTION; 
 
     if (!clientId || !clientSecret) {
         throw new Error("Missing PhonePe Credentials in .env");
@@ -603,10 +606,8 @@ app.post('/api/payment/create-order', isAuthenticated('participant'), async (req
         const checksum = sha256 + "###" + saltIndex;
 
         // 6. Send Request via Axios (Direct API Call)
-        // Check ENV to decide URL
-        const phonePeHost = process.env.PHONEPE_ENV === 'PRODUCTION' 
-            ? "https://api.phonepe.com/apis/hermes" 
-            : "https://api-preprod.phonepe.com/apis/pg-sandbox";
+        // FORCE PRODUCTION URL - The '404' happens because we were hitting Sandbox with Prod Creds.
+        const phonePeHost = "https://api.phonepe.com/apis/hermes";
 
         const options = {
             method: 'post',
