@@ -518,6 +518,7 @@ app.post('/api/register-event', isAuthenticated('participant'), async (req, res)
 
 // --- UPDATED CREATE ORDER ROUTE ---
 // --- UPDATED CREATE ORDER ROUTE (Production Ready) ---
+// --- MANUAL PHONEPE INTEGRATION (Bypassing SDK Builder issues) ---
 app.post('/api/payment/create-order', isAuthenticated('participant'), async (req, res) => {
     try {
         const { amount, couponCode } = req.body;
@@ -548,40 +549,76 @@ app.post('/api/payment/create-order', isAuthenticated('participant'), async (req
         const platformFee = Math.ceil(baseAmount * 0.0236);
         const totalAmount = baseAmount + platformFee;
 
-        // 2. Prepare SDK Client
-        const client = initPhonePeClient();
-
-        // 3. Generate Identifiers
+        // 2. Generate & Sanitize Identifiers (CRITICAL FOR PRODUCTION)
         const merchantTransactionId = "TXN_" + uuidv4().substring(0, 18);
         
-        // CLEAN USER ID: Remove special chars to satisfy PhonePe Regex
-        const merchantUserId = user.email.replace(/[^a-zA-Z0-9]/g, "_");
+        // Sanitize User ID (Max 36 chars, alphanumeric)
+        let cleanUserId = user.email.replace(/[^a-zA-Z0-9]/g, "_");
+        if (cleanUserId.length > 30) cleanUserId = cleanUserId.substring(0, 30);
+        const merchantUserId = `${cleanUserId}_${Math.floor(1000 + Math.random() * 9000)}`;
 
-        // 4. Robust Redirect URL Construction (Critical for Render)
-        // Render sets 'RENDER_EXTERNAL_URL', use it if available.
-        // Otherwise fallback to request headers, forcing HTTPS.
-        const protocol = process.env.RENDER_EXTERNAL_URL ? 'https' : 'https'; 
+        // Sanitize Mobile (Must be 10 digits)
+        let rawMobile = user.mobile ? user.mobile.toString() : "9999999999";
+        let cleanMobile = rawMobile.replace(/\D/g, ''); 
+        if (cleanMobile.length > 10) cleanMobile = cleanMobile.slice(-10);
+        else if (cleanMobile.length < 10) cleanMobile = "9999999999";
+
+        // 3. Construct Redirect URL
         const host = process.env.RENDER_EXTERNAL_URL 
-            ? process.env.RENDER_EXTERNAL_URL.replace('https://', '') 
+            ? process.env.RENDER_EXTERNAL_URL.replace('https://', '').replace('http://', '')
             : req.get('host');
-            
+        // IMPORTANT: Point this to a page that can handle the redirect. 
+        // For now pointing to cart, but ideally should be a specific success page.
         const redirectUrl = `https://${host}/participant/cart`;
 
-        // 5. Build Request using SDK
-        // NOTE: merchantUserId is MANDATORY in Production
-        const request = StandardCheckoutPayRequest.builder()
-            .merchantOrderId(merchantTransactionId)
-            .amount(totalAmount * 100) // Amount must be in Paise
-            .redirectUrl(redirectUrl)
-            .merchantUserId(merchantUserId) // <--- CRITICAL FIX: Missing in your previous code
-            .mobileNumber(user.mobile || "9999999999") // Recommended: Use dummy if user mobile missing
-            .build();
+        // 4. Construct Payload Manually (Standard PhonePe JSON)
+        const payload = {
+            "merchantId": process.env.PHONEPE_MERCHANT_ID,
+            "merchantTransactionId": merchantTransactionId,
+            "merchantUserId": merchantUserId,
+            "amount": totalAmount * 100, // in paise
+            "redirectUrl": redirectUrl,
+            "redirectMode": "POST", // PhonePe will POST data here after payment
+            "callbackUrl": redirectUrl, // S2S callback
+            "mobileNumber": cleanMobile,
+            "paymentInstrument": {
+                "type": "PAY_PAGE"
+            }
+        };
 
-        // 6. Send Request via SDK
-        const response = await client.pay(request);
-        const payPageUrl = response.redirectUrl;
+        // 5. Encode & Sign
+        const base64Payload = Buffer.from(JSON.stringify(payload)).toString('base64');
+        const saltKey = process.env.PHONEPE_CLIENT_SECRET; // Your Salt Key
+        const saltIndex = process.env.PHONEPE_SALT_INDEX || 1; // Default to 1 if missing
+        
+        const stringToSign = base64Payload + "/pg/v1/pay" + saltKey;
+        const sha256 = crypto.createHash('sha256').update(stringToSign).digest('hex');
+        const checksum = sha256 + "###" + saltIndex;
 
-        // 7. Update Coupon Stats (Optional: better to do this after success, but keeping your logic)
+        // 6. Send Request via Axios
+        // Determine Host URL (Prod vs Sandbox) based on Env
+        const phonePeHost = process.env.PHONEPE_ENV === 'PRODUCTION' 
+            ? "https://api.phonepe.com/apis/hermes" 
+            : "https://api-preprod.phonepe.com/apis/pg-sandbox";
+
+        const options = {
+            method: 'post',
+            url: `${phonePeHost}/pg/v1/pay`,
+            headers: {
+                'Content-Type': 'application/json',
+                'X-VERIFY': checksum
+            },
+            data: {
+                request: base64Payload
+            }
+        };
+
+        const response = await axios(options);
+        
+        // 7. Get Redirect URL from Response
+        const payPageUrl = response.data.data.instrumentResponse.redirectInfo.url;
+
+        // 8. Update Coupon Stats
         if (couponApplied) {
             await docClient.send(new UpdateCommand({
                 TableName: 'Lakshya_Coupons', Key: { code: couponCode.toUpperCase() },
@@ -596,11 +633,11 @@ app.post('/api/payment/create-order', isAuthenticated('participant'), async (req
         });
 
     } catch (err) {
-        console.error("PhonePe SDK Create Order Error:", err);
-        // Send a clean error message to the frontend
-        res.status(500).json({ error: "Payment initiation failed. " + err.message });
+        console.error("PhonePe Manual Create Order Error:", err.response ? err.response.data : err.message);
+        res.status(500).json({ error: "Payment initiation failed. Please try again." });
     }
 });
+
 // --- UPDATED VERIFY ROUTE ---
 app.post('/api/payment/verify', isAuthenticated('participant'), async (req, res) => {
     try {
