@@ -342,7 +342,8 @@ app.post('/api/auth/login', async (req, res) => {
             role: user.role, 
             name: user.fullName,
             dept: user.dept,
-            managedEventId: user.managedEventId || null 
+            managedEventId: user.managedEventId || null,
+            mobile: user.mobile // Added mobile to session for easy access
         };
         
         res.status(200).json({ message: 'Login successful' });
@@ -516,9 +517,8 @@ app.post('/api/register-event', isAuthenticated('participant'), async (req, res)
     }
 });
 
-// --- UPDATED CREATE ORDER ROUTE ---
-// --- UPDATED CREATE ORDER ROUTE (Production Ready) ---
-// --- MANUAL PHONEPE INTEGRATION (Bypassing SDK Builder issues) ---
+// --- UPDATED CREATE ORDER ROUTE (MANUAL INTEGRATION) ---
+// Bypasses SDK "StandardCheckoutPayRequest" issues entirely
 app.post('/api/payment/create-order', isAuthenticated('participant'), async (req, res) => {
     try {
         const { amount, couponCode } = req.body;
@@ -549,54 +549,61 @@ app.post('/api/payment/create-order', isAuthenticated('participant'), async (req
         const platformFee = Math.ceil(baseAmount * 0.0236);
         const totalAmount = baseAmount + platformFee;
 
-        // 2. Generate & Sanitize Identifiers (CRITICAL FOR PRODUCTION)
+        // 2. Generate Identifiers & SANITIZE DATA (CRITICAL)
         const merchantTransactionId = "TXN_" + uuidv4().substring(0, 18);
         
-        // Sanitize User ID (Max 36 chars, alphanumeric)
+        // FIX 1: Truncate User ID (Max 36 chars)
         let cleanUserId = user.email.replace(/[^a-zA-Z0-9]/g, "_");
-        if (cleanUserId.length > 30) cleanUserId = cleanUserId.substring(0, 30);
+        if (cleanUserId.length > 30) {
+            cleanUserId = cleanUserId.substring(0, 30);
+        }
         const merchantUserId = `${cleanUserId}_${Math.floor(1000 + Math.random() * 9000)}`;
 
-        // Sanitize Mobile (Must be 10 digits)
+        // FIX 2: Force 10-Digit Mobile
+        // PhonePe will reject +91 or spaces. We strip everything non-numeric.
+        // We use the mobile from the session, or fallback to dummy.
         let rawMobile = user.mobile ? user.mobile.toString() : "9999999999";
         let cleanMobile = rawMobile.replace(/\D/g, ''); 
-        if (cleanMobile.length > 10) cleanMobile = cleanMobile.slice(-10);
-        else if (cleanMobile.length < 10) cleanMobile = "9999999999";
+        
+        if (cleanMobile.length > 10) {
+            cleanMobile = cleanMobile.slice(-10); // Take last 10 digits
+        } else if (cleanMobile.length < 10) {
+            cleanMobile = "9999999999"; // Fallback
+        }
 
         // 3. Construct Redirect URL
+        // We must use HTTPS and the correct domain
         const host = process.env.RENDER_EXTERNAL_URL 
             ? process.env.RENDER_EXTERNAL_URL.replace('https://', '').replace('http://', '')
             : req.get('host');
-        // IMPORTANT: Point this to a page that can handle the redirect. 
-        // For now pointing to cart, but ideally should be a specific success page.
         const redirectUrl = `https://${host}/participant/cart`;
 
-        // 4. Construct Payload Manually (Standard PhonePe JSON)
+        // 4. Construct Payload (MANUAL JSON - NO SDK BUILDER)
         const payload = {
             "merchantId": process.env.PHONEPE_MERCHANT_ID,
             "merchantTransactionId": merchantTransactionId,
             "merchantUserId": merchantUserId,
-            "amount": totalAmount * 100, // in paise
+            "amount": totalAmount * 100, // paise
             "redirectUrl": redirectUrl,
-            "redirectMode": "POST", // PhonePe will POST data here after payment
-            "callbackUrl": redirectUrl, // S2S callback
+            "redirectMode": "POST",
+            "callbackUrl": redirectUrl,
             "mobileNumber": cleanMobile,
             "paymentInstrument": {
                 "type": "PAY_PAGE"
             }
         };
 
-        // 5. Encode & Sign
+        // 5. Base64 Encode & Checksum
         const base64Payload = Buffer.from(JSON.stringify(payload)).toString('base64');
         const saltKey = process.env.PHONEPE_CLIENT_SECRET; // Your Salt Key
-        const saltIndex = process.env.PHONEPE_SALT_INDEX || 1; // Default to 1 if missing
+        const saltIndex = process.env.PHONEPE_SALT_INDEX || 1; 
         
         const stringToSign = base64Payload + "/pg/v1/pay" + saltKey;
         const sha256 = crypto.createHash('sha256').update(stringToSign).digest('hex');
         const checksum = sha256 + "###" + saltIndex;
 
-        // 6. Send Request via Axios
-        // Determine Host URL (Prod vs Sandbox) based on Env
+        // 6. Send Request via Axios (Direct API Call)
+        // Check ENV to decide URL
         const phonePeHost = process.env.PHONEPE_ENV === 'PRODUCTION' 
             ? "https://api.phonepe.com/apis/hermes" 
             : "https://api-preprod.phonepe.com/apis/pg-sandbox";
@@ -615,10 +622,10 @@ app.post('/api/payment/create-order', isAuthenticated('participant'), async (req
 
         const response = await axios(options);
         
-        // 7. Get Redirect URL from Response
+        // 7. Get Redirect URL
         const payPageUrl = response.data.data.instrumentResponse.redirectInfo.url;
 
-        // 8. Update Coupon Stats
+        // 8. Update Coupon Stats (Optional)
         if (couponApplied) {
             await docClient.send(new UpdateCommand({
                 TableName: 'Lakshya_Coupons', Key: { code: couponCode.toUpperCase() },
@@ -634,6 +641,7 @@ app.post('/api/payment/create-order', isAuthenticated('participant'), async (req
 
     } catch (err) {
         console.error("PhonePe Manual Create Order Error:", err.response ? err.response.data : err.message);
+        // Provide clear feedback to frontend
         res.status(500).json({ error: "Payment initiation failed. Please try again." });
     }
 });
