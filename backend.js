@@ -100,6 +100,7 @@ const sesClient = new SESv2Client({
 });
 
 // Initialize PhonePe Client (Singleton Pattern)
+// Used ONLY for verify/status check, NOT for create order
 const initPhonePeClient = () => {
     const clientId = process.env.PHONEPE_CLIENT_ID;
     const clientSecret = process.env.PHONEPE_CLIENT_SECRET;
@@ -110,7 +111,6 @@ const initPhonePeClient = () => {
         throw new Error("Missing PhonePe Credentials in .env");
     }
 
-    // The SDK handles Auth Tokens automatically using these credentials
     return StandardCheckoutClient.getInstance(clientId, clientSecret, clientVersion, env);
 };
 
